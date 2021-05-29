@@ -1,0 +1,435 @@
+---
+title: "MovieLens Project"
+author: "Tobiloba Oyediran"
+date: "5/24/2021"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## OVERVIEW
+
+The MovieLens 10M dataset is a compilation of ratings given to movies by users who have watched the movies.
+
+The objective of this project is to develop an algorithm which can predict the rating a user is likely to give a movie. To achieve this a prediction model is developed and progressively improved using a large part (90%) of the MovieLens dataset to train the model. This is split into a training set (for training the model) and test set (for testing the model after each improvement), using the root-mean-square-error, RMSE, as the measure of performance of the model.
+
+The incremental steps taken in developing and improving the model are:
+1 - Guessing the rating
+2 - Assuming average rating
+3 - Incorporating influence of the movie (movie effect) on the rating
+4 - Incorporating biases of individual users (user bias) on the rating
+5 - Regularizing movie effect and user bias 
+
+A significant improvement in the RMSE (from 1.94146770 at step 1, to 0.86473761 at step 5) obtained.The final improved model is then used to predict the ratings in the remaining part (10%) of the dataset. The final RMSE obtained for this prediction is 0.86481774
+
+
+## ANALYSIS
+
+### After Downloading and Tidying the data
+``` {r include=FALSE, results='hide'}
+library(tidyverse)
+library(caret)
+library(data.table)
+library(stringr)
+```
+
+```{r echo=FALSE, warning=FALSE, error=FALSE, message=FALSE}
+dl <- tempfile()
+download.file("http://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+
+ratings <- fread(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+                 col.names = c("userId", "movieId", "rating", "timestamp"))
+
+movies <- str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+colnames(movies) <- c("movieId", "title", "genres")
+
+# if using R 4.0 or later:
+movies <- as.data.frame(movies) %>%
+  mutate(movieId = as.numeric(movieId),
+         title = as.character(title),
+         genres = as.character(genres))
+
+movielens <- left_join(ratings, movies, by = "movieId")
+```
+
+##### Inspecting the dataset
+```{r echo=FALSE, warning=FALSE, error=FALSE, message=FALSE}
+head(movielens)
+```
+All observations are now in rows and the variables in the dataset are in columns. The dataset is tidy and ready for analysis.
+
+### Data Exploration
+
+```{r echo=FALSE, warning=FALSE, error=FALSE, message=FALSE}
+str(movielens)
+```
+
+The movielens dataset contains the **10000054 observations**. There are 6 variables: **userId** (ID assigned to user rating the movie), **movieId** (ID assigned to the movie being rated), **rating** (the rating given by user), **timestamp** (numeric value of time when rating was given), **title** (movie title, with year of release in parenthesis ()) and **genres** (all the genres the movie belongs to, each genre separated by a pipe |)
+
+
+```{r echo=FALSE, warning=FALSE, error=FALSE, message=FALSE}
+range(movielens$rating)
+```
+
+The rating given to a movie ranges between 0.5 and 5.0
+
+
+```{r echo=FALSE, warning=FALSE, error=FALSE, message=FALSE}
+ggplot(movielens, aes(rating)) +
+  geom_histogram()
+```
+
+It appears as though there is a general bias towards giving a full-star (integer) rating rather than half-star (fractional) rating. 4.0, followed by 3.0 and 5.0 are three most common ratings.
+
+
+#### Inspecting the range of years the movies were released
+```{r echo=FALSE, warning=FALSE, error=FALSE, message=FALSE}
+movielens %>%
+  mutate(year = str_sub(title, -5, -2)) %>%
+  .$year %>%
+  range()
+```
+
+The dataset contains movies released from 1915 to 2008.
+
+
+#### Visualizing the general trend of ratings over the years
+```{r echo=FALSE, warning=FALSE, error=FALSE, message=FALSE}
+ratings_per_movie <- movielens %>%
+  mutate(year = str_sub(title, -5, -2)) %>%
+  count(movieId, year) 
+ratings_per_movie %>%
+  ggplot(aes(year, n)) +
+  geom_point(alpha = 0.2) + 
+  ggtitle("Plot of number of ratings for individual movies released in each year") +
+  xlab("Year movie was released") + 
+  ylab("Number of ratings")
+```
+
+```{r echo=FALSE, warning=FALSE, error=FALSE, message=FALSE}
+ratings_per_movie %>%
+  group_by(year) %>%
+  summarise(n_ratings = sum(n)) %>%     # total number of ratings in each year 
+  ggplot(aes(year, n_ratings)) +
+  geom_point() + 
+  ggtitle("Trend of total number of ratings received by all movie released in a year") +
+  ylab("Total number of ratings")
+```
+
+From the visualizations above, the number of ratings for movies generally increased over time, and then declined sharply for movies recently released.
+
+
+```{r echo=FALSE, warning=FALSE, error=FALSE, message=FALSE}
+# year with the highest total number of ratings
+ratings_per_movie %>%
+  group_by(year) %>%
+  summarise(n_ratings = sum(n)) %>% 
+  arrange(desc(n_ratings)) %>%
+  head(10)
+```
+The year with the highest total number of ratings is 1995, with 874436 ratings. The top 10 years with the highest total number of ratings fall within the early 1990s to early 2000s. 
+It is likely that the development of machine learning field and the advent of recommender systems contributed to the rise in the number of ratings over the years. The latest movies may not have been watched by enough users for them to have as many ratings as is expected.
+
+
+### Developing a prediction model
+
+```{r echo=FALSE, warning=FALSE, error=FALSE, message=FALSE}
+# Validation set will be 10% of MovieLens data
+set.seed(1, sample.kind="Rounding") # if using R 3.5 or earlier, use `set.seed(1)`
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = F)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+
+# Make sure userId and movieId in validation set are also in edx set
+validation <- temp %>%
+  semi_join(edx, by = "movieId") %>%
+  semi_join(edx, by = "userId")
+
+# Add rows removed from validation set back into edx set
+removed <- anti_join(temp, validation)
+edx <- rbind(edx, removed)
+
+# Clear the environment
+#rm(dl, ratings, movies, test_index, temp, movielens, removed, ratings_per_movie)
+```
+
+The edx data is split to create a test set (20%), and a training set (80%)
+
+```{r echo=FALSE, warning=FALSE, error=FALSE, message=FALSE}
+# Test set will be 20% of edx
+sub_index <- createDataPartition(edx$rating, times = 1, p=0.2, list = F)
+train_set <- edx[-sub_index, ]
+temp <- edx[sub_index, ]
+
+#Ensure that users and movies in the test set are also in the training set
+test_set <- temp %>%
+  semi_join(train_set, by = "movieId") %>%
+  semi_join(train_set, by = "userId")
+
+# Add rows from test_set back into training set
+removed <- anti_join(temp, test_set)
+train_set <- bind_rows(train_set, removed)
+
+# Clean up the environment
+#rm(sub_index, temp, removed)
+```
+
+##### Function to calculate root-mean-square error (RMSE)
+``` {r }
+RMSE <- function(predicted_value, true_value) {
+  sqrt(mean((predicted_value - true_value)^2))
+}
+```
+
+#### Building the Recommender System Algorithm
+
+#### Step 1: Randomly guessing the rating
+```{r echo=FALSE, warning=FALSE, error=FALSE, message=FALSE}
+# Create a vector of same length as test_set, with random rating values between 0.5 and 5.0
+guess <- sample(seq(0.5, 5.0, 0.5), nrow(test_set), replace = T)
+# Calculate RMSE
+RMSE_guess <- RMSE(guess, test_set$rating)
+RMSE_guess
+```
+The RMSE is almost 2
+
+```{r echo=FALSE, warning=FALSE, error=FALSE, message=FALSE}
+# Store the result in a table
+results <- data.frame(method = "Just a guess", RMSE = RMSE_guess)
+```
+
+
+#### Step 2: Predicting the average rating for all movies
+```{r echo=FALSE, warning=FALSE, error=FALSE, message=FALSE}
+rating_avg <- mean(train_set$rating)    # average rating in the training set
+# Create a vector of same length as test_set, with average rating repeated throughout
+pred_avg <- rep(rating_avg, nrow(test_set))
+# Calculate RMSE
+RMSE_avg <- RMSE(pred_avg, test_set$rating)
+RMSE_avg
+```
+We see a significant improvement in RMSE when predicting average compared to when just guessing, (RMSE dropped from 1.941945 to 1.060704) as the mean is more representative of the data than just a random guess.
+
+```{r echo=FALSE, warning=FALSE, error=FALSE, message=FALSE}
+# Update the results table
+results <- bind_rows(results, data.frame(method = "Predicting average", RMSE = RMSE_avg))
+```
+
+
+#### Step 3: Trying to improve prediction by incorporating (possible) movie effect
+To make up for the error in predicting the average rating by factoring in the effect of individual characteristics: we use the average error in prediction for each movie as the movie effect
+
+$movieEffect = sum(trueRating - averageRating)/N$ 
+where N = number of ratings for the movie
+
+```{r echo=FALSE, warning=FALSE, error=FALSE, message=FALSE}
+# Calculate movie effect in the training set
+movie_effect <- train_set %>%
+  group_by(movieId) %>% 
+  summarise(m_e = mean(rating - rating_avg))
+# Predicting rating with movie effect incorporated
+pred_rating <- test_set %>% 
+  left_join(movie_effect, by = "movieId") %>% 
+  summarise(pred = rating_avg + m_e) %>% 
+  .$pred
+# Calculate RMSE
+RMSE_pred <- RMSE(pred_rating, test_set$rating)
+RMSE_pred
+```
+We see more improvement in RMSE: from 1.060704 to 0.9437144, when movie effect is accounted for. This shows that there is indeed a "movie effect"
+
+```{r echo=FALSE, warning=FALSE, error=FALSE, message=FALSE}
+# Update the results table
+results <- bind_rows(results, data.frame(method = "Model incoporating movie effect", RMSE = RMSE_pred))
+```
+
+
+#### Step 4: Improve prediction by further incorporating (possible) user bias
+To make up for the error in predicting the average rating by factoring in the individual user's personal preferences concerning movies: we use the average error in prediction (after including the movie effect calculated above) for each user as the user bias
+
+$userBias = sum(trueRating - (averageRating + movieEffect))/N$ 
+where N = number of ratings given by user
+
+```{r echo=FALSE, warning=FALSE, error=FALSE, message=FALSE}
+# Calculate user bias in the training set
+user_bias <- train_set %>%
+    left_join(movie_effect, by = "movieId") %>%
+    group_by(userId) %>%
+    summarise(u_b = mean(rating - rating_avg - m_e))
+# Predicting rating with movie effect and user bias incorporated
+pred_rating <- test_set %>%
+  left_join(movie_effect, by = "movieId") %>%
+  left_join(user_bias, by = "userId") %>%
+  summarise(pred = rating_avg + m_e + u_b) %>% 
+  .$pred
+# Calculate RMSE
+RMSE_pred_2 <- RMSE(pred_rating, test_set$rating)
+RMSE_pred_2
+```
+We see more improvement in RMSE: from 0.9437144 to 0.8661625, when both movie effect and user bias are accounted for. This shows that individual user's bias also affects the rating given to a movie.
+
+```{r echo=FALSE, warning=FALSE, error=FALSE, message=FALSE}
+# Update the results table
+results <- bind_rows(results, data.frame(method = "Model with movie effect and user bias", 
+                                         RMSE = RMSE_pred_2))
+```
+
+
+#### Exploring the data further
+To see if the number of ratings affects the difference between the true rating and the average rating.
+```{r echo=FALSE, warning=FALSE, error=FALSE, message=FALSE}
+train_set %>% group_by(movieId) %>%
+  summarise(n_ratings = n()) %>%
+  left_join(movie_effect, by = "movieId") %>%
+  ggplot(aes(n_ratings, abs(m_e))) + 
+  geom_line() +
+  ggtitle("Plot of movie effect as affected by number of ratings") + 
+  ylab("Movie effect") +
+  xlab("Number of ratings")
+```
+
+Generally, the movie effect tends to get closer to zero, i.e. the error in prediction due to individual movie characteristics tends to diminish to almost zero as the number of ratings increases.
+
+
+```{r echo=FALSE, warning=FALSE, error=FALSE, message=FALSE}
+train_set %>% group_by(userId) %>%
+  summarise(n_ratings = n()) %>%
+  left_join(user_bias, by = "userId") %>%
+  ggplot(aes(n_ratings, abs(u_b))) + 
+  geom_line() +
+    ggtitle("Plot of user bias as affected by number of ratings") +
+  ylab("User bias") +
+  xlab("Number of ratings")
+```
+
+Also, the user bias generally tends to get closer to zero, i.e. the error in prediction due to individual user's movie preferences tends to diminish to almost zero as the number of ratings increases.
+
+Applying regularization to the movie effect and user bias by adding an arbitrary number, lambda (l), to the number of ratings for each movie while calculating movie effect, and for each user while calculating the user bias will reduce the error in prediction for movies that are unpopular (those that have few ratings)
+
+#### Step 5: Regularizing the effect of unpopular movies
+
+##### Select a range of lambdas to find which value minimizes the RMSE
+```{r echo=FALSE, warning=FALSE, error=FALSE, message=FALSE}
+lambdas <- seq(1,10)
+lambdas
+```
+
+
+##### Create function to calculate regularized RMSE for a given value of lambda using
+$movieEffectReg = sum(trueRating - averageRating)/(N + lambda)$
+$userBiasReg = sum(trueRating - (averageRating + movieEffect))/(N + lambda)$
+```{r echo=FALSE, warning=FALSE, error=FALSE, message=FALSE}
+RMSE_reg <- function(l) {
+  # Regularize the movie effect
+  movie_effect_reg <- train_set %>%
+    group_by(movieId) %>%
+    summarise(m_e_reg = sum(rating - rating_avg)/(n() + l))
+  # Regularize the user bias
+  user_bias_reg <- train_set %>%  
+    left_join(movie_effect_reg, by = "movieId") %>%
+    group_by(userId) %>%
+    summarise(u_b_reg = sum(rating - rating_avg - m_e_reg)/(n() + l))
+  # Predicting rating with regularized movie effect and user bias incorporated
+  pred_rating <- test_set %>%
+    left_join(movie_effect_reg, by = "movieId") %>%
+    left_join(user_bias_reg, by = "userId") %>%
+    summarise(pred = rating_avg + m_e_reg + u_b_reg) %>%
+    .$pred
+  # Calculate RMSE
+  RMSE(pred_rating, test_set$rating)
+}
+```
+
+##### Plot of RMSEs of the regularized model for each lambda value in the range selected
+```{r echo=FALSE, warning=FALSE, error=FALSE, message=FALSE}
+reg <- data.frame(lambda = lambdas, RMSE = sapply(lambdas, RMSE_reg))
+reg %>% ggplot(aes(lambda, RMSE)) +
+  geom_line()
+```
+
+From the plot, it appears that 5 is the value of lambda that minimizes the RMSE when regularization is applied to movie effect and user bias in the prediction model
+
+##### The value of lambda that best minimizes the RMSE
+```{r echo=FALSE, warning=FALSE, error=FALSE, message=FALSE}
+lambda <- lambdas[which.min(reg$RMSE)]
+lambda
+```
+The value of lambda that minimizes the RMSE is 5
+
+```{r echo=FALSE, warning=FALSE, error=FALSE, message=FALSE}
+# Update the results table
+results <- bind_rows(results, data.frame(method = "Improved model with regularization", 
+                                         RMSE = min(reg$RMSE)))
+```
+
+The best RMSE (when lambda of 5 is used)
+```{r echo=FALSE, warning=FALSE, error=FALSE, message=FALSE}
+min(reg$RMSE)
+```
+This also gives an improvement in RMSE
+
+
+#### Step 6: Apply the improved model in Step 5 to predict the values in the validation data set
+
+##### Using the best value of lambda (5); with edx as the training data for the model:
+##### 1. Recalculate the regularized movie effect and user bias, and Predict rating in the validation data
+##### 2. Calculate the final RMSE
+```{r echo=FALSE, warning=FALSE, error=FALSE, message=FALSE}
+#Regularized movie effect
+movie_effect_reg <- edx %>%
+  group_by(movieId) %>%
+  summarise(m_e_reg = sum(rating - rating_avg)/(n() + lambda))
+
+# Regularized user bias
+user_bias_reg <- edx %>%  
+  left_join(movie_effect_reg, by = "movieId") %>%
+  group_by(userId) %>%
+  summarise(u_b_reg = sum(rating - rating_avg - m_e_reg)/(n() + lambda))
+
+##### Predict rating (in the validation data) with regularized movie effect and user bias incorporated
+pred_validation <- validation %>%
+  left_join(movie_effect_reg, by = "movieId") %>%
+  left_join(user_bias_reg, by = "userId") %>%
+  summarise(pred = rating_avg + m_e_reg + u_b_reg) %>%
+  .$pred
+
+##### Calculate the final RMSE
+RMSE_validation <- RMSE(pred_validation, validation$rating)
+RMSE_validation
+```
+The RMSE obtained using the edx dataset as the training data, and the validation data for testing the final model is 0.8648177. This shows an improvement over the 0.8655444 obtained when we used the data partitions (train_set for training, and test_set for testing) from the edx dataset.
+
+
+### RESULTS
+
+#### RMSEs obtained for each step of model training, and calculating the % improvement in model performance
+```{r }
+# Update the results table
+results <- bind_rows(results, data.frame(method = "Improved model applied to the validation set", 
+                                         RMSE = RMSE_validation))
+# Calculate percentage improvement in model performance
+results <- mutate(results, "% improvement" = (RMSE[1] - RMSE)*100 / RMSE[1])
+results <- bind_cols(data.frame(step = c(1:6)), results)
+results
+```
+From the results table, it is evident that:
+
+1. Predicting the average overall rating performed much better that the random guessing. This shows that the overall average is more representative of the dataset than a random guess.
+
+2. There is incremental improvement in performance of the model as other influencing factors such as movie effect and user bias are introduced into the model.
+
+3. Comparing the performance of the model in Steps 5 and 6, the model performed better when a larger training set is used (edx is larger than train_set). This suggests that the larger the training dataset, the lower the error of prediction using this model.
+
+
+### CONCLUSION
+The model performance has been significantly improved by incorporating some factors such as movie effect and user bias that have been seen to affect how users rate movies. Regularizing these effects also provided additional improvement.
+
+#### Limitation of this work
+This report does not explore the effect of other factors such as the genre of the movie, or the time gap between when the movie was released and when it was rated. These factors could also significantly affect how users rate movies and could be useful for improving the prediction model.
+
+#### Future work
+To further improve the performance of the prediction model, an exploration of the effects of movie genre and time gap between movie release and rating could be a way to go. Also, applying more sophisticated algorithms such as nearest neighbor or random forest, as well as creating an ensemble of multiple algorithms, may produce far greater improvements for the prediction model.
